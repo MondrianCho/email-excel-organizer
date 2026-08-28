@@ -3,10 +3,17 @@
 이메일 접수 엑셀 정리 자동화
 - 폴더 내 엑셀 파일명을 'yyyy-mm-dd 이메일 접수_초안.xlsx'로 변경
 - E열(제목) 2행부터 확인하여 K열(업무종류), L열, N열, O열 자동 입력
+- '오전 이메일 백업' 폴더의 이메일 본문 앞부분에서 날짜를 찾아 M열(마감일)에 입력
+- I열(관리번호)이 빈칸이고 K열이 미정이면 K열 '기타' / L열 '(기타)기타'로 보완
 """
+import email
+import email.policy
+import html
+import re
 import sys
+from collections import defaultdict
+from datetime import date, datetime
 from pathlib import Path
-from datetime import datetime
 
 try:
     import openpyxl
@@ -20,12 +27,45 @@ except ImportError:
 # 열 번호 (1-based)
 COL_C = 3   # 발신
 COL_E = 5   # 제목
+COL_I = 9   # 관리번호
 COL_K = 11  # 업무종류
 COL_L = 12
+COL_M = 13  # 마감일
 COL_N = 14
 COL_O = 15
 
 DATA_START_ROW = 2
+
+BACKUP_SUBDIR = "오전 이메일 백업"
+BODY_SCAN_LINES = 5
+
+# 이메일 접수 구조(제목/관리번호/업무종류 등)와 일치하는 시트만 자동 분류 대상으로 삼는다.
+# 그 외 시트(사건리스트, 수식 등)는 건드리지 않는다.
+TARGET_SHEET_NAMES = {"오전", "오후"}
+
+MONTH_NAMES = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+
+# "August 27, 2026" / "Aug. 27 2026"
+RE_MONTH_DD_YYYY = re.compile(r"\b([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})\b")
+# "27 August 2026"
+RE_DD_MONTH_YYYY = re.compile(r"\b(\d{1,2})\s+([A-Za-z]{3,9})\.?,?\s+(\d{4})\b")
+# "08-27-2026" / "08/27/2026" (월/일/년, 미국식)
+RE_MM_DD_YYYY = re.compile(r"\b(\d{1,2})[/-](\d{1,2})[/-](\d{4})\b")
+# "2026-08-27"
+RE_YYYY_MM_DD = re.compile(r"\b(\d{4})-(\d{1,2})-(\d{1,2})\b")
 
 # 시트 글꼴: 맑은 고딕 10
 SHEET_FONT = Font(name="맑은 고딕", size=10)
@@ -121,12 +161,23 @@ def safe_str(v):
     return str(v).strip()
 
 
+def normalize_title(s: str) -> str:
+    """비교용: 앞뒤 공백 제거, 연속 공백 하나로."""
+    if not s:
+        return ""
+    return " ".join(s.split())
+
+
 def get_e_value(ws, row):
     return safe_str(ws.cell(row=row, column=COL_E).value)
 
 
 def get_c_value(ws, row):
     return safe_str(ws.cell(row=row, column=COL_C).value)
+
+
+def get_i_value(ws, row):
+    return safe_str(ws.cell(row=row, column=COL_I).value)
 
 
 def match_e_rules(title):
@@ -140,8 +191,140 @@ def match_e_rules(title):
     return None
 
 
-def process_sheet(ws):
-    """시트에서 E열 2행부터 읽어 K,L,N,O 채우기."""
+def _parse_month(name: str):
+    return MONTH_NAMES.get(name.lower().rstrip("."))
+
+
+def parse_date_from_text(text: str):
+    """텍스트에서 처음 발견되는 유효한 날짜를 yyyy-mm-dd 문자열로 반환. 없으면 None."""
+    candidates = []
+    for m in RE_MONTH_DD_YYYY.finditer(text):
+        month = _parse_month(m.group(1))
+        if month is not None:
+            candidates.append((m.start(), month, int(m.group(2)), int(m.group(3))))
+    for m in RE_DD_MONTH_YYYY.finditer(text):
+        month = _parse_month(m.group(2))
+        if month is not None:
+            candidates.append((m.start(), month, int(m.group(1)), int(m.group(3))))
+    for m in RE_YYYY_MM_DD.finditer(text):
+        candidates.append((m.start(), int(m.group(2)), int(m.group(3)), int(m.group(1))))
+    for m in RE_MM_DD_YYYY.finditer(text):
+        candidates.append((m.start(), int(m.group(1)), int(m.group(2)), int(m.group(3))))
+
+    candidates.sort(key=lambda c: c[0])
+    for _, month, day, year in candidates:
+        try:
+            return date(year, month, day).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def is_email_file(p: Path) -> bool:
+    return p.suffix.lower() in (".eml", ".msg")
+
+
+def strip_html(text: str) -> str:
+    text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return html.unescape(text)
+
+
+def read_eml_subject_and_lines(path: Path, n: int = BODY_SCAN_LINES):
+    with path.open("rb") as fh:
+        msg = email.message_from_binary_file(fh, policy=email.policy.default)
+    subject = normalize_title(safe_str(msg.get("Subject")))
+
+    part = msg.get_body(preferencelist=("plain", "html"))
+    text = ""
+    if part is not None:
+        try:
+            text = part.get_content()
+        except Exception:
+            text = ""
+        if part.get_content_type() == "text/html":
+            text = strip_html(text)
+    lines = [l.strip() for l in text.splitlines() if l.strip()][:n]
+    return subject, lines
+
+
+def read_msg_subject_and_lines(path: Path, n: int = BODY_SCAN_LINES):
+    import extract_msg
+
+    msg = extract_msg.Message(str(path))
+    try:
+        subject = normalize_title(safe_str(msg.subject))
+        text = safe_str(msg.body)
+        if not text:
+            html_body = msg.htmlBody
+            if isinstance(html_body, bytes):
+                html_body = html_body.decode("utf-8", errors="ignore")
+            text = strip_html(html_body) if html_body else ""
+    finally:
+        msg.close()
+    lines = [l.strip() for l in text.splitlines() if l.strip()][:n]
+    return subject, lines
+
+
+def collect_email_subject_dates(backup_folder: Path):
+    """'오전 이메일 백업' 폴더의 이메일을 읽어 (정규화 제목 → 본문 앞부분 날짜) 매핑 생성.
+    같은 제목의 이메일이 여러 개면 어느 행에 대응하는지 알 수 없으므로 제외한다."""
+    logs = []
+
+    if not backup_folder.is_dir():
+        logs.append(f"[안내] '{BACKUP_SUBDIR}' 폴더가 없어 M열(마감일) 자동 입력은 건너뜁니다.")
+        return {}, logs
+
+    msg_files = sorted(backup_folder.glob("*.msg"))
+    eml_files = sorted(backup_folder.glob("*.eml"))
+
+    has_extract = False
+    try:
+        import extract_msg  # noqa: F401
+
+        has_extract = True
+    except ImportError:
+        pass
+    if msg_files and not has_extract:
+        logs.append(f"[안내] .msg 파일 {len(msg_files)}개 — pip install extract-msg 필요, 건너뜁니다.")
+        msg_files = []
+
+    subject_date: dict = {}
+    subject_count: dict = defaultdict(int)
+
+    for p in msg_files + eml_files:
+        try:
+            if p.suffix.lower() == ".msg":
+                subject, lines = read_msg_subject_and_lines(p)
+            else:
+                subject, lines = read_eml_subject_and_lines(p)
+        except Exception as e:
+            logs.append(f"  [오류] {p.name}: {e}")
+            continue
+
+        if not subject:
+            continue
+
+        found_date = parse_date_from_text("\n".join(lines))
+        subject_count[subject] += 1
+        if subject not in subject_date:
+            subject_date[subject] = found_date
+
+    duplicates = [s for s, c in subject_count.items() if c > 1]
+    if duplicates:
+        logs.append(f"[안내] 동일 제목 이메일 {len(duplicates)}종류는 행을 특정할 수 없어 M열 입력에서 제외합니다.")
+
+    result = {
+        s: d for s, d in subject_date.items()
+        if d is not None and subject_count[s] == 1
+    }
+    logs.append(f"[안내] 이메일 {len(msg_files) + len(eml_files)}개 중 날짜 매칭 {len(result)}건 확보.")
+    return result, logs
+
+
+def process_sheet(ws, email_dates=None):
+    """시트에서 E열 2행부터 읽어 K,L,M,N,O 채우기."""
+    email_dates = email_dates or {}
     max_row = ws.max_row
     if max_row < DATA_START_ROW:
         return 0
@@ -177,6 +360,15 @@ def process_sheet(ws):
             if eo is not None:
                 o_val = eo
 
+        # 3) 실제 접수 행(제목 있음)인데 관리번호(I열)가 빈칸이고
+        #    위 규칙으로 K열이 정해지지 않았으면 '기타'로 보완
+        if e_val and k_val is None and not get_i_value(ws, row):
+            k_val = "기타"
+            l_val = "(기타)기타"
+
+        # 4) 제목이 이메일 본문에서 찾은 날짜와 매칭되면 M열(마감일)에 반영
+        m_val = email_dates.get(normalize_title(e_val)) if e_val else None
+
         # 셀에 반영 (값이 정해진 것만)
         if k_val is not None:
             if ws.cell(row=row, column=COL_K).value != k_val:
@@ -185,6 +377,10 @@ def process_sheet(ws):
         if l_val is not None:
             if ws.cell(row=row, column=COL_L).value != l_val:
                 ws.cell(row=row, column=COL_L).value = l_val
+                changed += 1
+        if m_val is not None:
+            if ws.cell(row=row, column=COL_M).value != m_val:
+                ws.cell(row=row, column=COL_M).value = m_val
                 changed += 1
         if n_val is not None:
             if ws.cell(row=row, column=COL_N).value != n_val:
@@ -235,14 +431,20 @@ def process_folder(folder_path: str):
         print(f"[안내] 해당 폴더에서 엑셀 파일을 찾지 못했습니다: {folder}")
         return
 
-    print(f"[안내] 엑셀 파일 {len(files)}개 발견. 처리 시작.\n")
+    email_dates, email_logs = collect_email_subject_dates(folder / BACKUP_SUBDIR)
+    for line in email_logs:
+        print(line)
+
+    print(f"\n[안내] 엑셀 파일 {len(files)}개 발견. 처리 시작.\n")
 
     for f in files:
         try:
             wb = openpyxl.load_workbook(f, read_only=False, data_only=False)
             total_changed = 0
             for ws in wb.worksheets:
-                total_changed += process_sheet(ws)
+                if ws.title not in TARGET_SHEET_NAMES:
+                    continue
+                total_changed += process_sheet(ws, email_dates)
                 apply_sheet_font(ws)
             wb.save(f)
             wb.close()
