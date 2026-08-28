@@ -258,7 +258,6 @@ def process_folder(folder_path: str):
             continue
         if new_path.exists() and new_path != f:
             # 이미 같은 이름 파일 있으면 번호 붙이기
-            stem = f"{f.parent / (new_name.replace('.xlsx',''))}"
             for i in range(1, 100):
                 candidate = f.parent / f"{new_name.replace('.xlsx','')}_{i}.xlsx"
                 if not candidate.exists():
