@@ -5,6 +5,9 @@
 - E열(제목) 2행부터 확인하여 K열(업무종류), L열, N열, O열 자동 입력
 - '오전 이메일 백업' 폴더의 이메일 본문 앞부분에서 날짜를 찾아 M열(마감일)에 입력
 - I열(관리번호)이 빈칸이고 K열이 미정이면 K열 '기타' / L열 '(기타)기타'로 보완
+- 첨부파일명에 'Issue Notification'이 포함되면 K열 '등록' / L열 '(등록)US_issue notification'로
+  분류하고, 첨부파일(스캔 PDF)을 OCR로 읽어 O열에 'ISSUE DATE: yyyy-mm-dd'를 입력
+  (Tesseract OCR 미설치 시 이 항목만 건너뜀)
 """
 import email
 import email.policy
@@ -38,6 +41,9 @@ DATA_START_ROW = 2
 
 BACKUP_SUBDIR = "오전 이메일 백업"
 BODY_SCAN_LINES = 5
+ISSUE_NOTIFICATION_FILENAME_HINT = "issue notification"
+ISSUE_DATE_LABEL = "ISSUE DATE"
+ISSUE_DATE_SEARCH_WINDOW = 300
 
 # 이메일 접수 구조(제목/관리번호/업무종류 등)와 일치하는 시트만 자동 분류 대상으로 삼는다.
 # 그 외 시트(사건리스트, 수식 등)는 건드리지 않는다.
@@ -230,7 +236,8 @@ def strip_html(text: str) -> str:
     return html.unescape(text)
 
 
-def read_eml_subject_and_lines(path: Path, n: int = BODY_SCAN_LINES):
+def read_eml_details(path: Path, n: int = BODY_SCAN_LINES):
+    """(정규화 제목, 본문 앞 n줄, [(첨부파일명, bytes), ...]) 반환."""
     with path.open("rb") as fh:
         msg = email.message_from_binary_file(fh, policy=email.policy.default)
     subject = normalize_title(safe_str(msg.get("Subject")))
@@ -245,10 +252,18 @@ def read_eml_subject_and_lines(path: Path, n: int = BODY_SCAN_LINES):
         if part.get_content_type() == "text/html":
             text = strip_html(text)
     lines = [l.strip() for l in text.splitlines() if l.strip()][:n]
-    return subject, lines
+
+    attachments = []
+    for p in msg.walk():
+        if p.get_content_disposition() == "attachment":
+            data = p.get_payload(decode=True)
+            if data:
+                attachments.append((p.get_filename() or "", data))
+    return subject, lines, attachments
 
 
-def read_msg_subject_and_lines(path: Path, n: int = BODY_SCAN_LINES):
+def read_msg_details(path: Path, n: int = BODY_SCAN_LINES):
+    """(정규화 제목, 본문 앞 n줄, [(첨부파일명, bytes), ...]) 반환."""
     import extract_msg
 
     msg = extract_msg.Message(str(path))
@@ -260,20 +275,88 @@ def read_msg_subject_and_lines(path: Path, n: int = BODY_SCAN_LINES):
             if isinstance(html_body, bytes):
                 html_body = html_body.decode("utf-8", errors="ignore")
             text = strip_html(html_body) if html_body else ""
+        attachments = [
+            (safe_str(att.longFilename or att.shortFilename), att.data)
+            for att in msg.attachments
+            if getattr(att, "data", None)
+        ]
     finally:
         msg.close()
     lines = [l.strip() for l in text.splitlines() if l.strip()][:n]
-    return subject, lines
+    return subject, lines, attachments
 
 
-def collect_email_subject_dates(backup_folder: Path):
-    """'오전 이메일 백업' 폴더의 이메일을 읽어 (정규화 제목 → 본문 앞부분 날짜) 매핑 생성.
+def _ocr_available():
+    try:
+        import fitz  # noqa: F401
+        import pytesseract
+        from PIL import Image  # noqa: F401
+
+        pytesseract.get_tesseract_version()
+        return True
+    except Exception:
+        return False
+
+
+def extract_issue_date_from_pdf(data: bytes):
+    """스캔된 Issue Notification PDF를 OCR로 읽어 ISSUE DATE 값을 yyyy-mm-dd로 반환. 실패 시 None."""
+    import io
+
+    import fitz
+    import pytesseract
+    from PIL import Image
+
+    try:
+        doc = fitz.open(stream=data, filetype="pdf")
+    except Exception:
+        return None
+
+    try:
+        for page in doc:
+            pix = page.get_pixmap(dpi=200)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            try:
+                text = pytesseract.image_to_string(img)
+            except Exception:
+                return None
+            idx = text.upper().find(ISSUE_DATE_LABEL)
+            if idx == -1:
+                continue
+            snippet = text[idx: idx + ISSUE_DATE_SEARCH_WINDOW]
+            found = parse_date_from_text(snippet)
+            if found:
+                return found
+    finally:
+        doc.close()
+    return None
+
+
+def find_issue_notification_info(attachments, ocr_available: bool):
+    """(Issue Notification 첨부파일 존재 여부, OCR로 찾은 ISSUE DATE 또는 None) 반환.
+    첨부파일 존재 여부는 OCR 가능 여부와 무관하게 판단한다."""
+    matches = [data for name, data in attachments if ISSUE_NOTIFICATION_FILENAME_HINT in name.lower()]
+    if not matches:
+        return False, None
+
+    issue_date = None
+    if ocr_available:
+        for data in matches:
+            issue_date = extract_issue_date_from_pdf(data)
+            if issue_date:
+                break
+    return True, issue_date
+
+
+def collect_email_data(backup_folder: Path):
+    """'오전 이메일 백업' 폴더의 이메일을 읽어 정규화 제목을 키로 하는 세 매핑을 만든다.
+    (본문 앞부분 날짜, Issue Notification 첨부파일 존재 여부, 첨부파일 OCR로 찾은 ISSUE DATE)
     같은 제목의 이메일이 여러 개면 어느 행에 대응하는지 알 수 없으므로 제외한다."""
     logs = []
+    empty = ({}, {}, {})
 
     if not backup_folder.is_dir():
-        logs.append(f"[안내] '{BACKUP_SUBDIR}' 폴더가 없어 M열(마감일) 자동 입력은 건너뜁니다.")
-        return {}, logs
+        logs.append(f"[안내] '{BACKUP_SUBDIR}' 폴더가 없어 M열/ISSUE DATE 자동 입력은 건너뜁니다.")
+        return empty, logs
 
     msg_files = sorted(backup_folder.glob("*.msg"))
     eml_files = sorted(backup_folder.glob("*.eml"))
@@ -289,15 +372,21 @@ def collect_email_subject_dates(backup_folder: Path):
         logs.append(f"[안내] .msg 파일 {len(msg_files)}개 — pip install extract-msg 필요, 건너뜁니다.")
         msg_files = []
 
-    subject_date: dict = {}
+    ocr_available = _ocr_available()
+    if not ocr_available:
+        logs.append("[안내] OCR(pymupdf/pytesseract 또는 Tesseract) 미설치 — Issue Notification ISSUE DATE 자동 인식은 건너뜁니다.")
+
+    subject_body_date: dict = {}
+    subject_is_issue_notification: dict = {}
+    subject_issue_date: dict = {}
     subject_count: dict = defaultdict(int)
 
     for p in msg_files + eml_files:
         try:
             if p.suffix.lower() == ".msg":
-                subject, lines = read_msg_subject_and_lines(p)
+                subject, lines, attachments = read_msg_details(p)
             else:
-                subject, lines = read_eml_subject_and_lines(p)
+                subject, lines, attachments = read_eml_details(p)
         except Exception as e:
             logs.append(f"  [오류] {p.name}: {e}")
             continue
@@ -305,26 +394,34 @@ def collect_email_subject_dates(backup_folder: Path):
         if not subject:
             continue
 
-        found_date = parse_date_from_text("\n".join(lines))
         subject_count[subject] += 1
-        if subject not in subject_date:
-            subject_date[subject] = found_date
+        if subject in subject_body_date:
+            continue  # 첫 번째 이메일 값만 보관 (중복은 마지막에 제외 처리)
+
+        subject_body_date[subject] = parse_date_from_text("\n".join(lines))
+        is_issue_notification, issue_date = find_issue_notification_info(attachments, ocr_available)
+        subject_is_issue_notification[subject] = is_issue_notification
+        subject_issue_date[subject] = issue_date
 
     duplicates = [s for s, c in subject_count.items() if c > 1]
     if duplicates:
-        logs.append(f"[안내] 동일 제목 이메일 {len(duplicates)}종류는 행을 특정할 수 없어 M열 입력에서 제외합니다.")
+        logs.append(f"[안내] 동일 제목 이메일 {len(duplicates)}종류는 행을 특정할 수 없어 자동 입력에서 제외합니다.")
 
-    result = {
-        s: d for s, d in subject_date.items()
-        if d is not None and subject_count[s] == 1
-    }
-    logs.append(f"[안내] 이메일 {len(msg_files) + len(eml_files)}개 중 날짜 매칭 {len(result)}건 확보.")
-    return result, logs
+    unique_subjects = {s for s, c in subject_count.items() if c == 1}
+    body_dates = {s: d for s, d in subject_body_date.items() if d is not None and s in unique_subjects}
+    issue_notifications = {s for s in unique_subjects if subject_is_issue_notification.get(s)}
+    issue_dates = {s: d for s, d in subject_issue_date.items() if d is not None and s in unique_subjects}
+
+    logs.append(f"[안내] 이메일 {len(msg_files) + len(eml_files)}개 중 M열 날짜 매칭 {len(body_dates)}건, "
+                f"Issue Notification 첨부 {len(issue_notifications)}건(그중 ISSUE DATE 인식 {len(issue_dates)}건) 확보.")
+    return (body_dates, issue_notifications, issue_dates), logs
 
 
-def process_sheet(ws, email_dates=None):
+def process_sheet(ws, email_dates=None, issue_notification_subjects=None, issue_dates=None):
     """시트에서 E열 2행부터 읽어 K,L,M,N,O 채우기."""
     email_dates = email_dates or {}
+    issue_notification_subjects = issue_notification_subjects or set()
+    issue_dates = issue_dates or {}
     max_row = ws.max_row
     if max_row < DATA_START_ROW:
         return 0
@@ -367,7 +464,17 @@ def process_sheet(ws, email_dates=None):
             l_val = "(기타)기타"
 
         # 4) 제목이 이메일 본문에서 찾은 날짜와 매칭되면 M열(마감일)에 반영
-        m_val = email_dates.get(normalize_title(e_val)) if e_val else None
+        norm_title = normalize_title(e_val) if e_val else ""
+        m_val = email_dates.get(norm_title) if norm_title else None
+
+        # 5) 첨부파일에 Issue Notification이 있으면 K/L을 확정하고, OCR로 찾은
+        #    ISSUE DATE가 있으면 비고(O열)에 반영. 첨부파일 근거가 제목 규칙보다 우선한다.
+        if norm_title and norm_title in issue_notification_subjects:
+            k_val = "등록"
+            l_val = "(등록)US_issue notification"
+            found_issue_date = issue_dates.get(norm_title)
+            if found_issue_date:
+                o_val = f"ISSUE DATE: {found_issue_date}"
 
         # 셀에 반영 (값이 정해진 것만)
         if k_val is not None:
@@ -431,7 +538,7 @@ def process_folder(folder_path: str):
         print(f"[안내] 해당 폴더에서 엑셀 파일을 찾지 못했습니다: {folder}")
         return
 
-    email_dates, email_logs = collect_email_subject_dates(folder / BACKUP_SUBDIR)
+    (email_dates, issue_notification_subjects, issue_dates), email_logs = collect_email_data(folder / BACKUP_SUBDIR)
     for line in email_logs:
         print(line)
 
@@ -444,7 +551,7 @@ def process_folder(folder_path: str):
             for ws in wb.worksheets:
                 if ws.title not in TARGET_SHEET_NAMES:
                     continue
-                total_changed += process_sheet(ws, email_dates)
+                total_changed += process_sheet(ws, email_dates, issue_notification_subjects, issue_dates)
                 apply_sheet_font(ws)
             wb.save(f)
             wb.close()

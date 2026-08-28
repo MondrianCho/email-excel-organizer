@@ -12,6 +12,8 @@ from email_excel_organize import (
     COL_K,
     COL_L,
     COL_M,
+    COL_O,
+    find_issue_notification_info,
     get_new_filename,
     is_email_file,
     is_excel_file,
@@ -153,6 +155,37 @@ class TestProcessSheetNewColumns(unittest.TestCase):
         self._set_row(2, subject="No matching email for this one", management_no="SP001")
         process_sheet(self.ws, email_dates={"다른 제목": "2026-08-27"})
         self.assertIsNone(self.ws.cell(row=2, column=COL_M).value)
+
+    def test_issue_notification_attachment_overrides_title_classification(self):
+        subject = "Reporting - Received Non-Final Office Action"  # 원래는 OA로 분류됨
+        self._set_row(2, subject=subject, management_no="SP001")
+        norm = normalize_title(subject)
+        process_sheet(self.ws, issue_notification_subjects={norm}, issue_dates={norm: "2026-09-08"})
+        self.assertEqual(self.ws.cell(row=2, column=COL_K).value, "등록")
+        self.assertEqual(self.ws.cell(row=2, column=COL_L).value, "(등록)US_issue notification")
+        self.assertEqual(self.ws.cell(row=2, column=COL_O).value, "ISSUE DATE: 2026-09-08")
+
+    def test_issue_notification_without_ocr_date_leaves_o_blank(self):
+        subject = "Some report"
+        self._set_row(2, subject=subject, management_no="SP001")
+        norm = normalize_title(subject)
+        process_sheet(self.ws, issue_notification_subjects={norm}, issue_dates={})
+        self.assertEqual(self.ws.cell(row=2, column=COL_K).value, "등록")
+        self.assertIsNone(self.ws.cell(row=2, column=COL_O).value)
+
+
+class TestFindIssueNotificationInfo(unittest.TestCase):
+    def test_no_matching_attachment_returns_false_none(self):
+        attachments = [("random report.pdf", b"data")]
+        self.assertEqual(find_issue_notification_info(attachments, ocr_available=True), (False, None))
+
+    def test_matching_attachment_without_ocr_returns_true_none(self):
+        attachments = [("0202-1913 Issue Notification.pdf", b"data")]
+        self.assertEqual(find_issue_notification_info(attachments, ocr_available=False), (True, None))
+
+    def test_matching_is_case_insensitive(self):
+        attachments = [("ISSUE NOTIFICATION.PDF", b"data")]
+        self.assertEqual(find_issue_notification_info(attachments, ocr_available=False), (True, None))
 
 
 if __name__ == "__main__":
